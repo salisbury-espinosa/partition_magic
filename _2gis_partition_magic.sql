@@ -1,8 +1,8 @@
-﻿CREATE OR REPLACE FUNCTION _2gis_partition_magic_before_insert_trigger() RETURNS trigger AS $$
+CREATE OR REPLACE FUNCTION _2gis_partition_magic_before_insert_trigger() RETURNS trigger AS $$
 DECLARE
 	hasMeta boolean;
 	meta RECORD;
-	partition_id integer;
+	partition_id varchar(255);
 	itable text;
 	partitionRes boolean;
 BEGIN
@@ -13,8 +13,8 @@ BEGIN
 	END LOOP;
 
 	IF hasMeta THEN
-		EXECUTE format('SELECT ($1).%I', meta.action_field) USING NEW INTO partition_id;
-		itable := meta.partition_table_prefix || partition_id::text;
+		EXECUTE format('SELECT SUBSTRING(COALESCE(($1).%I,'''')::varchar(255), 1, 4)', meta.action_field) USING NEW INTO partition_id;
+		itable := meta.partition_table_prefix || partition_id;
 
 		IF ( NOT EXISTS ( SELECT 1 FROM pg_tables t WHERE t.schemaname = meta.schema_name AND t.tablename = itable ) ) THEN
 			partitionRes := _2gis_partition_magic(meta.parent_table_name, meta.action_field, partition_id, meta.schema_name, meta.partition_table_prefix, FALSE);
@@ -29,6 +29,7 @@ $$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION _2gis_partition_magic_after_insert_trigger() RETURNS trigger AS $$
 DECLARE
+  parent_table_name_pk_value varchar(255);
 	hasMeta boolean;
 	meta RECORD;
 	itable text;
@@ -40,16 +41,18 @@ BEGIN
 	END LOOP;
 
 	IF hasMeta THEN
-		EXECUTE 'DELETE FROM ONLY ' || meta.parent_table_name || ' WHERE id = ' || NEW.id || ';';
+    EXECUTE format('SELECT ($1).%I', meta.parent_table_name_pk) USING NEW INTO parent_table_name_pk_value;
+		EXECUTE 'DELETE FROM ONLY ' || meta.parent_table_name || ' WHERE ' || meta.parent_table_name_pk || ' = ''' || parent_table_name_pk_value || ''';';
 	END IF;
 
 	RETURN NULL;
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE OR REPLACE FUNCTION _2gis_partition_magic(parent_table text, action_field text, partition_idx integer = NULL, schema_name text = NULL, partition_table_prefix text = NULL, is_debug boolean = FALSE) RETURNS boolean AS $$
+CREATE OR REPLACE FUNCTION _2gis_partition_magic(parent_table text, action_field text, partition_idx varchar(255) = NULL, schema_name text = NULL, partition_table_prefix text = NULL, is_debug boolean = FALSE) RETURNS boolean AS $$
 DECLARE
     itable varchar(255);
+    parent_table_name_pk varchar(255);
     logtable varchar(255);
     idx1_name varchar(255);
     idx2_name varchar(255);
@@ -78,7 +81,7 @@ BEGIN
 
 	IF ( NOT EXISTS ( SELECT 1 FROM pg_tables t WHERE t.schemaname = schema_name AND t.tablename = '_2gis_partition_magic_meta' ) ) THEN
 		IF(is_debug) THEN RAISE INFO '----- [Creating META table "%"] -----', '_2gis_partition_magic_meta'; END IF;
-		EXECUTE 'CREATE TABLE _2gis_partition_magic_meta (id integer, table_name character varying(255), action_field character varying(255), partition_id integer, schema_name character varying(255), partition_table_prefix character varying(255), parent_table_name character varying(255), created_at TIMESTAMP DEFAULT NOW());';
+		EXECUTE 'CREATE TABLE _2gis_partition_magic_meta (id integer, table_name character varying(255), action_field character varying(255), partition_id varchar(255), schema_name character varying(255), partition_table_prefix character varying(255), parent_table_name character varying(255), parent_table_name_pk character varying(255), created_at TIMESTAMP DEFAULT NOW());';
 		EXECUTE 'CREATE INDEX table_name_idx ON _2gis_partition_magic_meta (table_name);';
 		EXECUTE 'CREATE INDEX partition_id_idx ON _2gis_partition_magic_meta (partition_id);';
 		EXECUTE 'CREATE INDEX parent_table_name_idx ON _2gis_partition_magic_meta (parent_table_name);';
@@ -86,7 +89,18 @@ BEGIN
 
 	IF ( NOT EXISTS ( SELECT 1 FROM _2gis_partition_magic_meta m WHERE m.table_name = parent_table ) ) THEN
 		IF(is_debug) THEN RAISE INFO '----- [Creating META for table "%.%"] -----', schema_name, parent_table; END IF;
-		EXECUTE 'INSERT INTO _2gis_partition_magic_meta (table_name, action_field, partition_id, schema_name, partition_table_prefix, parent_table_name) VALUES (''' || parent_table || ''', ''' || action_field || ''', NULL, ''' || schema_name || ''', ''' || partition_table_prefix || ''', ''' || parent_table || ''');';
+    SELECT
+      pg_attribute.attname
+    FROM pg_index, pg_class, pg_attribute, pg_namespace
+    WHERE
+      pg_class.oid = parent_table::regclass AND
+      indrelid = pg_class.oid AND
+      nspname = 'public' AND
+      pg_class.relnamespace = pg_namespace.oid AND
+      pg_attribute.attrelid = pg_class.oid AND
+      pg_attribute.attnum = any(pg_index.indkey)
+     AND indisprimary INTO parent_table_name_pk;
+		EXECUTE 'INSERT INTO _2gis_partition_magic_meta (table_name, action_field, partition_id, schema_name, partition_table_prefix, parent_table_name, parent_table_name_pk) VALUES (''' || parent_table || ''', ''' || action_field || ''', NULL, ''' || schema_name || ''', ''' || partition_table_prefix || ''', ''' || parent_table || ''', ''' || parent_table_name_pk || ''');';
 	END IF;
 
 	IF ( NOT EXISTS ( SELECT g.tgfoid::regclass::text, pg_get_functiondef(p.oid) as procdef, prosrc, pg_get_triggerdef(g.oid) as tgdef, g.tgname
@@ -104,7 +118,7 @@ BEGIN
 		IF(is_debug) THEN RAISE INFO '----- [Detecting partitions...] -----'; END IF;
 		FOR tbl IN SELECT t.tablename, substring(t.tablename from '\_(\d+)$')::integer AS part_index FROM pg_tables t WHERE t.schemaname = schema_name AND t.tablename ~* ('^' || partition_table_prefix || '\d+') ORDER BY part_index ASC
 		LOOP
-			partition_idx := replace(tbl.tablename, partition_table_prefix, '')::integer;
+			partition_idx := replace(tbl.tablename, partition_table_prefix, '');
 			IF(is_debug) THEN RAISE INFO '----- [Found partition #%, table: "%.%"] -----', partition_idx, schema_name, tbl.tablename; END IF;
 			res := res AND _2gis_partition_magic(parent_table, action_field, partition_idx, schema_name, partition_table_prefix, is_debug);
 		END LOOP;
@@ -112,7 +126,7 @@ BEGIN
 		RETURN res;
 	END IF;
 
-	IF(partition_idx < 0) THEN
+	IF(partition_idx = '') THEN
 		partition_idx := NULL;
 		itable := partition_table_prefix;
 	ELSE
@@ -123,11 +137,24 @@ BEGIN
 
 	IF ( NOT EXISTS ( SELECT 1 FROM pg_tables t WHERE t.schemaname = schema_name AND t.tablename = itable ) ) THEN
 		IF(is_debug) THEN RAISE INFO 'Creating partition "%.%" for table "%.%"...', schema_name, itable, schema_name, parent_table; END IF;
-		EXECUTE 'CREATE TABLE ' || itable || ' (CONSTRAINT ' || itable || '_' || action_field || '_check CHECK (' || action_field || ' = ' || partition_idx || ')) INHERITS (' || parent_table ||');';
+		EXECUTE 'CREATE TABLE ' || itable || '() INHERITS (' || parent_table ||');';
 		-- IF(is_debug) THEN RAISE INFO 'Creating rules on table...'; END IF;
 		-- EXECUTE 'CREATE RULE ' || itable || '_insert AS ON INSERT TO ' || parent_table || ' WHERE NEW.' || action_field || ' = ' || partition_idx || ' DO INSTEAD INSERT INTO ' || itable || ' VALUES (NEW.*) RETURNING ' || itable || '.*;';
 		IF(is_debug) THEN RAISE INFO 'Creating meta info...'; END IF;
-		EXECUTE 'INSERT INTO _2gis_partition_magic_meta (table_name, action_field, partition_id, schema_name, partition_table_prefix, parent_table_name) VALUES (''' || itable || ''', ''' || action_field || ''', ' || partition_idx || ', ''' || schema_name || ''', ''' || partition_table_prefix || ''', ''' || parent_table || ''');';
+
+    SELECT
+      pg_attribute.attname
+    FROM pg_index, pg_class, pg_attribute, pg_namespace
+    WHERE
+      pg_class.oid = parent_table::regclass AND
+      indrelid = pg_class.oid AND
+      nspname = 'public' AND
+      pg_class.relnamespace = pg_namespace.oid AND
+      pg_attribute.attrelid = pg_class.oid AND
+      pg_attribute.attnum = any(pg_index.indkey)
+     AND indisprimary INTO parent_table_name_pk;
+
+		EXECUTE 'INSERT INTO _2gis_partition_magic_meta (table_name, action_field, partition_id, schema_name, partition_table_prefix, parent_table_name, parent_table_name_pk) VALUES (''' || itable || ''', ''' || action_field || ''', ''' || partition_idx || ''', ''' || schema_name || ''', ''' || partition_table_prefix || ''', ''' || parent_table || ''', ''' || parent_table_name_pk || ''');';
 	END IF;
 
 	IF(is_debug) THEN RAISE INFO 'Checking indexes...'; END IF;
@@ -314,4 +341,3 @@ BEGIN
 	RETURN res;
 END;
 $$ LANGUAGE plpgsql;
-
